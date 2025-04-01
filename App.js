@@ -7,10 +7,14 @@ import {
   ScrollView, 
   SafeAreaView, 
   StatusBar,
-  ActivityIndicator
+  ActivityIndicator,
+  Platform,
+  Alert
 } from 'react-native';
 import { Audio } from 'expo-av';
-import { soundData } from './soundData';
+import { soundData, getSoundFilePath } from './soundData';
+import audioCache from './src/AudioCache';
+import networkManager, { useNetworkStatus } from './src/NetworkManager';
 
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -18,6 +22,11 @@ export default function App() {
   const [currentSounds, setCurrentSounds] = useState({});
   const [sound, setSound] = useState(null);
   const [statusMessage, setStatusMessage] = useState('Ready to play sounds...');
+  const [retryCount, setRetryCount] = useState(0);
+  const [isRetrying, setIsRetrying] = useState(false);
+  
+  // Get network status using our custom hook
+  const networkStatus = useNetworkStatus();
 
   // Categories and their colors
   const categories = [
@@ -29,24 +38,141 @@ export default function App() {
     { name: 'Animals', color: '#00ACC1' }  // Teal
   ];
 
-  // Initialize audio
+  // Effect to handle network status changes
   useEffect(() => {
+    if (!networkStatus.isConnected && !loading) {
+      setStatusMessage('No network connection. Some features may be limited.');
+    } else if (networkStatus.isConnected && networkStatus.connectionQuality === 'poor') {
+      setStatusMessage('Poor network connection. Performance may be affected.');
+    }
+  }, [networkStatus, loading]);
+
+  // Function to initialize random sounds for each category
+  const initializeRandomSounds = () => {
+    console.log('Initializing random sounds for each category...');
+    const newSounds = {};
+    
+    // For each category, select a random sound
+    categories.forEach(category => {
+      const categoryName = category.name;
+      const categoryData = soundData[categoryName];
+      
+      if (categoryData && categoryData.length > 0) {
+        // Select a random sound from this category
+        const randomIndex = Math.floor(Math.random() * categoryData.length);
+        const selectedSound = categoryData[randomIndex];
+        
+        newSounds[categoryName] = {
+          id: selectedSound.id,
+          name: selectedSound.name,
+          clickCount: 0
+        };
+        
+        console.log(`Selected ${selectedSound.name} for ${categoryName}`);
+      } else {
+        console.warn(`No sounds available for category: ${categoryName}`);
+      }
+    });
+    
+    // Update the state with the new sounds
+    setCurrentSounds(newSounds);
+  };
+
+  // Initialize audio with network awareness
+  useEffect(() => {
+    let isMounted = true;
+    let setupTimeout;
+    
     async function setupAudio() {
       try {
         console.log('Setting up audio...');
-        await Audio.setAudioModeAsync({
+        setStatusMessage('Setting up audio...');
+        
+        // Configure audio settings with timeout handling
+        const setupPromise = Audio.setAudioModeAsync({
           allowsRecordingIOS: false,
           playsInSilentModeIOS: true,
           shouldDuckAndroid: true,
           playThroughEarpieceAndroid: false,
           staysActiveInBackground: true,
         });
-        console.log('Audio setup complete');
-        setLoading(false);
+        
+        // Set a timeout for the audio setup
+        const timeoutPromise = new Promise((_, reject) => {
+          setupTimeout = setTimeout(() => {
+            reject(new Error('Audio setup timed out. Please try again.'));
+          }, 10000); // 10 second timeout
+        });
+        
+        // Race the setup against the timeout
+        await Promise.race([setupPromise, timeoutPromise]);
+        
+        // Clear the timeout since setup completed
+        clearTimeout(setupTimeout);
+        
+        // Only proceed if component is still mounted
+        if (isMounted) {
+          // Initialize random sounds for each category
+          // This doesn't load the actual audio files, just selects which ones will be used
+          initializeRandomSounds();
+          
+          console.log('Audio setup complete');
+          setStatusMessage('Ready to play sounds...');
+          setLoading(false);
+          setRetryCount(0);
+          setIsRetrying(false);
+        }
       } catch (error) {
         console.error('Error setting up audio:', error);
-        setStatusMessage('Error setting up audio: ' + error.message);
-        setLoading(false);
+        
+        // Clear the timeout if it was a different error
+        clearTimeout(setupTimeout);
+        
+        // Only update state if component is still mounted
+        if (isMounted) {
+          const isTimeout = error.message.includes('timed out');
+          const isNetworkError = !networkStatus.isConnected || 
+                                error.message.includes('network') || 
+                                error.message.includes('connection');
+          
+          if ((isTimeout || isNetworkError) && retryCount < 3) {
+            // Retry setup with exponential backoff
+            setStatusMessage(`Connection issue. Retrying... (${retryCount + 1}/3)`);
+            setIsRetrying(true);
+            
+            // Exponential backoff delay
+            const delay = 1000 * Math.pow(2, retryCount);
+            setTimeout(() => {
+              if (isMounted) {
+                setRetryCount(prev => prev + 1);
+                setupAudio();
+              }
+            }, delay);
+          } else {
+            // Max retries reached or different error
+            setStatusMessage('Error setting up audio: ' + error.message);
+            setLoading(false);
+            setIsRetrying(false);
+            
+            // Show an alert with retry option
+            if (Platform.OS !== 'web') {
+              Alert.alert(
+                'Connection Error',
+                'Failed to initialize the app. Please check your connection and try again.',
+                [
+                  {
+                    text: 'Retry',
+                    onPress: () => {
+                      setLoading(true);
+                      setRetryCount(0);
+                      setupAudio();
+                    }
+                  }
+                ]
+              );
+            }
+          }
+        }
       }
     }
 
@@ -54,34 +180,57 @@ export default function App() {
 
     // Cleanup function
     return () => {
-      if (sound) {
-        console.log('Unloading sound on cleanup');
-        sound.unloadAsync();
-      }
+      // Clear the audio cache when component unmounts
+      audioCache.clearCache().catch(err => 
+        console.warn('Error clearing audio cache:', err)
+      );
     };
   }, []);
 
-  // Function to play a sound
+  // Function to play a sound using the audio cache with network resilience
   async function playSound(category, revealName = false) {
     try {
       console.log(`Attempting to play ${category} sound`);
+      setStatusMessage(`Loading ${category} sound...`);
       
-      // Unload previous sound if it exists
-      if (sound) {
-        await sound.unloadAsync();
+      // Check network status before attempting to play
+      if (!networkStatus.isConnected) {
+        setStatusMessage('No network connection. Cannot load new sounds.');
+        return;
       }
-
+      
+      // Get the sound object for this category
       const soundObj = currentSounds[category];
       
       if (soundObj) {
-        console.log(`Loading sound: ${soundObj.name}`);
+        console.log(`Playing sound: ${soundObj.name}`);
         
-        // Create a new sound object
-        const { sound: newSound } = await Audio.Sound.createAsync(
-          soundObj.file,
-          { shouldPlay: true }
-        );
+        // Find the sound item in the soundData
+        const categoryData = soundData[category];
+        const soundItem = categoryData.find(item => item.name === soundObj.name);
         
+        if (!soundItem) {
+          console.error(`Sound item not found for ${soundObj.name}`);
+          setStatusMessage(`Error: Sound not found`);
+          return;
+        }
+        
+        // Set a timeout for loading the sound
+        let timeoutId;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            reject(new Error('Sound loading timed out'));
+          }, 10000); // 10 second timeout
+        });
+        
+        // Play the sound using the audio cache with timeout handling
+        const soundPromise = audioCache.playSound(category, soundItem);
+        const newSound = await Promise.race([soundPromise, timeoutPromise]);
+        
+        // Clear the timeout since loading completed
+        clearTimeout(timeoutId);
+        
+        // Store the current sound reference
         setSound(newSound);
         
         // Update status message
@@ -199,6 +348,23 @@ export default function App() {
         
         <View style={styles.statusContainer}>
           <Text style={styles.statusText}>{statusMessage}</Text>
+          
+          {/* Network status indicator */}
+          <View style={styles.networkStatusContainer}>
+            <View style={[
+              styles.networkStatusIndicator, 
+              { backgroundColor: networkStatus.isConnected 
+                ? (networkStatus.connectionQuality === 'good' ? '#4CAF50' : '#FFC107') 
+                : '#F44336' 
+              }
+            ]} />
+            <Text style={styles.networkStatusText}>
+              {networkStatus.isConnected 
+                ? `Connected (${networkStatus.connectionType})` 
+                : 'Offline'
+              }
+            </Text>
+          </View>
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -220,6 +386,13 @@ const styles = StyleSheet.create({
     marginTop: 10,
     fontSize: 16,
     color: '#333',
+  },
+  networkWarning: {
+    marginTop: 10,
+    fontSize: 14,
+    color: '#F44336',
+    textAlign: 'center',
+    padding: 10,
   },
   scrollContainer: {
     flexGrow: 1,
@@ -285,5 +458,21 @@ const styles = StyleSheet.create({
     color: '#333',
     fontSize: 14,
     textAlign: 'center',
+  },
+  networkStatusContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 10,
+  },
+  networkStatusIndicator: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 5,
+  },
+  networkStatusText: {
+    fontSize: 12,
+    color: '#666',
   },
 });
